@@ -24,6 +24,7 @@ class MercadoPago
 
 		@rest_client = RestClient.new()
 		@sandbox = false
+		@traffic_light = nil
 	end
 
 	def set_debug_logger(debug_logger)
@@ -132,7 +133,7 @@ class MercadoPago
 		begin
 			access_token = get_access_token
 		rescue => e
-			return e.message
+			return e.messageº
 		end
 
 		filters["offset"] = offset
@@ -298,7 +299,9 @@ class MercadoPago
 		MIME_JSON = 'application/json'
 		MIME_FORM = 'application/x-www-form-urlencoded'
 		API_BASE_URL = URI.parse('https://api.mercadopago.com')
-
+		
+		METRICS_API_BASE_URL = URI.parse('https://events.mercadopago.com')
+		
 		def initialize(debug_logger=nil)
 			@http = Net::HTTP.new(API_BASE_URL.host, API_BASE_URL.port)
 
@@ -311,25 +314,55 @@ class MercadoPago
 			end
 
 			@http.set_debug_output debug_logger if debug_logger
+
+			@httpMetrics = Net::HTTP.new(METRICS_API_BASE_URL.host, METRICS_API_BASE_URL.port)
+
+			if METRICS_API_BASE_URL.scheme == "https" # enable SSL/TLS
+				@httpMetrics.use_ssl = true
+				@httpMetrics.verify_mode = OpenSSL::SSL::VERIFY_PEER
+
+				# explicitly tell OpenSSL not to use SSL3 nor TLS 1.0
+				@httpMetrics.ssl_options = OpenSSL::SSL::OP_NO_SSLv3 + OpenSSL::SSL::OP_NO_TLSv1
+			end
 		end
 
 		def set_debug_logger(debug_logger)
 			@http.set_debug_output debug_logger
 		end
 
-		def exec(method, uri, data, content_type)
+		def exec(method, uri, data, content_type, send_insights=false)
 			if not data.nil? and content_type == MIME_JSON
 				data = data.to_json
 			end
 
 			headers = {
 				'User-Agent' => "MercadoPago Ruby SDK v" + MERCADO_PAGO_VERSION,
-				'Content-type' => content_type,
-				'Accept' => MIME_JSON
+				'content-type' => content_type,
+				'Accept' => MIME_JSON,
+				"X-Insights-Metric-Lab-Scope" => 'test'
 			}
-
+			puts "send request to :" + uri
+			starting = Process.clock_gettime(Process::CLOCK_MONOTONIC)
 			api_result = @http.send_request(method, uri, data, headers)
-
+			ending = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+			elapsed = ending - starting
+			puts elapsed
+			begin
+				puts "send request to traffic light"
+				starting = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+				@traffic_light = get_traffic_light()	
+				ending = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+				elapsed = ending - starting
+				puts elapsed
+			rescue => exception
+				puts "Error get traffic light information"
+			
+				
+			end
+			if not @traffic_light == nil and @traffic_light["send_data"] and is_UrlWhitelist(uri , ["pepe" , "token"]) 
+				t = Thread.new {send_insights(method,uri , headers , api_result)}
+			end
+			
 			{
 				"status" => api_result.code,
 				"response" => JSON.parse(api_result.body)
@@ -337,19 +370,98 @@ class MercadoPago
 		end
 
 		def get(uri, content_type=MIME_JSON)
-			exec("GET", uri, nil, content_type)
+			exec("GET", uri, nil, content_type ,true)
 		end
 
 		def post(uri, data = nil, content_type=MIME_JSON)
-			exec("POST", uri, data, content_type)
+			exec("POST", uri, data, content_type ,true)
 		end
 
 		def put(uri, data = nil, content_type=MIME_JSON)
-			exec("PUT", uri, data, content_type)
+			exec("PUT", uri, data, content_type ,true)
 		end
 
 		def delete(uri, content_type=MIME_JSON)
-			exec("DELETE", uri, nil, content_type)
+			exec("DELETE", uri, nil, content_type,true)
+		end		
+
+		
+		def send_insights(method,uri,request_headers , data)
+
+				client_info_data = {"name" =>  "MercadoPago-SDK-Ruby" , "version" => MERCADO_PAGO_VERSION}
+				response_headers_data = {"x-request-id" => data["X-Request-Id"] , "content-type" => data['content-type'], "content-length" => data["content-length"]}
+				request_headers_data = {"content-type" => request_headers['content-type'], "content-length" => request_headers["content-length"]}
+				protocol_http_data = {"request-method" => method , "request-url" => API_BASE_URL +  uri  ,"request-headers" => request_headers_data , "response-headers" => response_headers_data}
+				protocol_info = {"protocol-http" => protocol_http_data}
+				data = {"Client-info" => client_info_data ,"protocol-info" => protocol_info}
+
+				request = data.to_json
+				
+				headers = {
+					'User-Agent' => "MercadoPago Ruby SDK v" + MERCADO_PAGO_VERSION,
+					'Content-type' => MIME_JSON,
+					'Accept' => MIME_JSON,
+					"X-Insights-Metric-Lab-Scope" => 'test'
+				}
+				api_result = @httpMetrics.send_request("POST", "/v2/metric", request, headers)
+			
 		end
+
+		def get_traffic_light()
+			
+			if @traffic_light != nil and DateTime.now.to_time < @traffic_light["ttl"]
+				return @traffic_light
+			end	
+
+			data = { 
+			"client-info" => {
+					"name" => "MercadoPago Ruby SDK",
+					"version" => MERCADO_PAGO_VERSION
+				}
+			}
+
+			request = data.to_json
+			
+			headers = {
+				'User-Agent' => "MercadoPago Ruby SDK v" + MERCADO_PAGO_VERSION,
+				'Content-type' => MIME_JSON,
+				'Accept' => MIME_JSON,
+				"X-Insights-Metric-Lab-Scope" => 'test'
+			}
+
+			api_result = @httpMetrics.send_request("POST", "/v2/traffic-light", request, headers)
+			response = JSON.parse(api_result.body)
+			ttl = DateTime.now.to_time + response["ttl"]
+
+			 {
+				"ttl" => ttl,
+				"send_data" => response["send-data"],
+				"endpoint_whitelist" => response["endpoint-whitelist"],
+				"base64_encode_data" => response["base64-encode-data"]
+			}	
+			
+		end
+
+		def is_UrlWhitelist (requestUrl  , urlsWhiteList)
+			for url in urlsWhiteList do
+				if url == "*"
+					return true
+				end
+				matched = true   
+                patterns = url.split("*")
+                for pattern in patterns do
+                    if pattern.length == 0
+						next
+					end	
+					matched = (matched and requestUrl.downcase.include?(pattern.downcase))
+				end		
+                if matched
+					return true  
+				end	
+
+			end
+			return false
+
+		end	
 	end
 end
