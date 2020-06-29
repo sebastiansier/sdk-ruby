@@ -90,6 +90,16 @@ class MercadoPago
 		get_payment(id)
 	end
 
+	def create_payment(payment_data)
+		begin
+			access_token = get_access_token
+		rescue => e
+			return e.message
+		end
+
+		@rest_client.post("/v1/payments?access_token=" + access_token, payment_data)
+	end
+
 	# Get information for specific authorized payment
 	def get_authorized_payment(id)
 		begin
